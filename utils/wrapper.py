@@ -1,141 +1,167 @@
-import time
 import torch
-import pickle
+import logging
 from tqdm import tqdm
-from torch.utils.data import DataLoader
-from core.dataset import OCEANDataset, read_essay_split
-from utils.config import ModelConfig, GeneralConfig
-from utils.utils import count_parameters, epoch_time
-from transformers import AutoModel, AutoTokenizer, AdamW
+from utils.utils import EarlyStopping
+from torch.utils.tensorboard import SummaryWriter
 
-mconfig = ModelConfig()
-gconfig = GeneralConfig()
+# Set up logging
+def train_step(generator, discriminator, gen_optimizer, disc_optimizer, data_loader, criterions, gen_scheduler, disc_scheduler, scaler, epoch, device, writer):
+    recon_criterion, gen_criterion = criterions
 
-tokenizer = AutoTokenizer.from_pretrained('roberta-base')
+    generator.train()
+    discriminator.train()
 
-def train(model, iterator, content_optimizer, style_optimizer, style_adv_optimizer, adv_optimizer, fine_tune, transfer, best_model):
+    total_gen_loss = 0.0
+    total_disc_loss = 0.0
     
-    ## trainer ##
-    
-    model.train()
-    recon_losses = 0
-    style_losses = 0
-    s_e_losses = 0
-    s_a_losses = 0
-    for i, batch in enumerate(tqdm(iterator)):
+    pbar = tqdm(enumerate(data_loader), total=len(data_loader), desc="Training")
+
+    for batch_idx, data in pbar:
+        text, labels = data['text'].to(device), data['labels'].to(device)
+        noise = torch.randn(text.size(0), 256, device=device).float()
         
-        input_ids = batch['input_ids'].to(gconfig.device)
-        labels = batch['labels'].to(gconfig.device)
-        recon_loss, style_loss, s_e_loss, s_a_loss = model(input_ids, labels, fine_tune, transfer, best_model, len(iterator)-1 == i)
+        # Discriminator training
+        disc_optimizer.zero_grad()
+
+        # Without AMP
+        generated_text = generator(noise, labels)
+        real_output = discriminator(text, labels)
+        fake_output = discriminator(generated_text.detach(), labels)
+        real_loss = recon_criterion(real_output, torch.ones_like(real_output))
+        fake_loss = recon_criterion(fake_output, torch.zeros_like(fake_output))
+        disc_loss = real_loss + fake_loss
+
+        disc_loss.backward()  # backward for discriminator
+        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+        disc_optimizer.step()  # update for discriminator
+
+        # Generator training
+        gen_optimizer.zero_grad()
+
+        generated_text_for_gen_loss = generator(noise, labels) 
+        output = discriminator(generated_text_for_gen_loss, labels)
+        gen_loss = gen_criterion(output, torch.ones_like(output))
+
+        gen_loss.backward()  # backward for generator
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+        gen_optimizer.step()  # update for generator
 
 
-        target_tokenids = model.transfer_style(input_ids, labels)
-        for i in range(len(target_tokenids)):
-            target_tokens = tokenizer.convert_ids_to_tokens(target_tokenids[i])
-            while '<pad>' in target_tokens:
-                target_tokens.remove('<pad>')
-        target_sentence = tokenizer.convert_tokens_to_string(target_tokens)
-        print("Style transfered sentence: {}".format(target_sentence))
+        total_gen_loss += gen_loss.item()
+        total_disc_loss += disc_loss.item()
 
-        content_loss = recon_loss
-        style_loss = style_loss
-
-        style_adv_optimizer.zero_grad()
-        s_a_loss.backward(retain_graph=True)
-        style_adv_optimizer.step()
+        gen_scheduler.step(epoch + batch_idx / len(data_loader))
+        disc_scheduler.step(epoch + batch_idx / len(data_loader))
+        pbar.set_postfix({'Gen Loss': gen_loss.item(), 'Disc Loss': disc_loss.item()})
         
-        content_optimizer.zero_grad()
-        content_loss.backward(retain_graph=True)
-        content_optimizer.step()
+        # 기록
+        global_step = epoch * len(data_loader) + batch_idx
+        writer.add_scalar('Val: Batch/Gen Loss', gen_loss.item(), global_step)
+        writer.add_scalar('Val: Batch/Disc Loss', disc_loss.item(), global_step)
+
+    return total_gen_loss / len(data_loader), total_disc_loss / len(data_loader)
+
+def test_step(generator, discriminator, data_loader, criterions, device, epoch, writer):
+    recon_criterion, gen_criterion = criterions
+
+    generator.eval()
+    discriminator.eval()
+
+    total_gen_loss = 0.0
+    total_disc_loss = 0.0
+
+    pbar = tqdm(enumerate(data_loader), total=len(data_loader), desc="Testing")
+
+    with torch.no_grad():  # disable gradient computation for evaluation
+        for batch_idx, data in pbar:
+            text, labels = data['text'].to(device), data['labels'].to(device)
+            noise = torch.randn(text.size(0), 256, device=device)
+
+            # Discriminator evaluation
+            generated_text = generator(noise, labels)
+            real_output = discriminator(text, labels)
+            fake_output = discriminator(generated_text, labels)
+            real_loss = recon_criterion(real_output, torch.ones_like(real_output))
+            fake_loss = recon_criterion(fake_output, torch.zeros_like(fake_output))
+            disc_loss = real_loss + fake_loss
+
+            # Generator evaluation
+            output = discriminator(generated_text, labels)
+            gen_loss = gen_criterion(output, torch.ones_like(output))
+
+            total_gen_loss += gen_loss.item()
+            total_disc_loss += disc_loss.item()
+            
+            # 기록
+            pbar.set_postfix({'Gen Loss': gen_loss.item(), 'Disc Loss': disc_loss.item()})
+            global_step = epoch * len(data_loader) + batch_idx
+            writer.add_scalar('Test: Batch/Gen Loss', gen_loss.item(), global_step)
+            writer.add_scalar('Test: Batch/Disc Loss', disc_loss.item(), global_step)
+            
+    return total_gen_loss / len(data_loader), total_disc_loss / len(data_loader)
+
+
+def save_checkpoint(state, filename="model/checkpoint.pth"):
+    logging.info("=> Saving checkpoint")
+    torch.save(state, filename)
+
+
+def load_checkpoint(checkpoint, generator, discriminator, gen_optimizer, disc_optimizer, gen_scheduler, disc_scheduler, scaler):
+    logging.info("=> Loading checkpoint")
+    generator.load_state_dict(checkpoint["generator_state_dict"])
+    discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+    if checkpoint["gen_optimizer_state_dict"]:        
+        gen_optimizer.load_state_dict(checkpoint["gen_optimizer_state_dict"])
+    elif checkpoint["disc_optimizer_state_dict"]:
+        disc_optimizer.load_state_dict(checkpoint["disc_optimizer_state_dict"])
+    elif checkpoint["gen_scheduler_state_dict"]:
+        gen_scheduler.load_state_dict(checkpoint["gen_scheduler_state_dict"])
+    elif checkpoint["disc_scheduler_state_dict"]:
+        disc_scheduler.load_state_dict(checkpoint["disc_scheduler_state_dict"])
+    elif checkpoint["scaler_state_dict"]:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+
+def train_model(generator, discriminator, data_loaders, optimizers, criterions, device, schedulers, scaler, num_epochs=5):
+    
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    writer = SummaryWriter()
+
+    best_gen_loss = float('inf')
+    gen_optimizer, disc_optimizer = optimizers
+    gen_scheduler, disc_scheduler = schedulers
+    early_stopping = EarlyStopping(patience=10)
+
+    for epoch in range(num_epochs):
         
-        # if not transfer:
-        style_optimizer.zero_grad()
-        style_loss.backward(retain_graph=True)
-        style_optimizer.step()
-
-        adv_optimizer.zero_grad()
-        s_e_loss.backward()
-        adv_optimizer.step()
-
-        recon_losses += recon_loss.item()
-        style_losses += style_loss.item()
-        s_e_losses += s_e_loss.item()
-        s_a_losses += s_a_loss.item()
-        del recon_loss, style_loss, s_e_loss, s_a_loss
-        del batch
-
-    recon_loss = recon_losses / len(iterator)
-    style_loss = style_losses / len(iterator)
-    s_e_loss = s_e_losses / len(iterator)
-    s_a_loss = s_a_losses / len(iterator)
-
-    return recon_loss, style_loss, s_e_loss, s_a_loss
-
-def evaluate(model, iterator, fine_tune, transfer):
-    
-    ## evaluate ##
-    
-    model.eval()
-    recon_losses = 0
-    style_losses = 0
-    s_e_losses = 0
-    s_a_losses = 0
-    with torch.no_grad():
-        for batch in tqdm(iterator):
-            input_ids = batch['input_ids'].to(gconfig.device)
-            labels = batch['labels'].to(gconfig.device)
-            recon_loss, style_loss, s_e_loss, s_a_loss = model(input_ids, labels, fine_tune, transfer, best_model=None, end_iter=None)
-            recon_losses += recon_loss.item()
-            style_losses += style_loss.item()
-            s_e_losses += s_e_loss.item()
-            s_a_losses += s_a_loss.item()
-            del recon_loss, style_loss, s_e_loss, s_a_loss
-            del batch
-    recon_loss = recon_losses / len(iterator)
-    style_loss = style_losses / len(iterator)
-    s_e_loss = s_e_losses / len(iterator)
-    s_a_loss = s_a_losses / len(iterator)
-
-    return recon_loss, style_loss, s_e_loss, s_a_loss
-
-def epoch_train(N_EPOCHS, best_valid_loss, model, train_iterator, valid_iterator, content_optimizer, style_adv_optimizer, style_optimizer, adv_optimizer, fine_tune, transfer):
-    
-    print(f'The model has {count_parameters(model):,} trainable parameters')
-
-    valid_loss = 999999
-    for epoch in range(N_EPOCHS):
+        train_gen_loss, train_disc_loss = train_step(generator, discriminator, gen_optimizer, disc_optimizer, data_loaders['train'], criterions, gen_scheduler, disc_scheduler, scaler, epoch, device, writer)
+        val_gen_loss, val_disc_loss = test_step(generator, discriminator, data_loaders['val'], criterions, device, epoch, writer)
         
-        start_time = time.time()
-        train_recon_loss, train_style_loss, train_s_e_loss, train_s_a_loss = train(model, train_iterator, content_optimizer, style_optimizer, style_adv_optimizer, adv_optimizer, fine_tune, transfer, valid_loss == best_valid_loss)
-        valid_recon_loss, valid_style_loss, valid_s_e_loss, valid_s_a_loss = evaluate(model, valid_iterator, fine_tune, transfer)
+        logging.info(f"Epoch [{epoch+1}/{num_epochs}] | Train Gen Loss: {train_gen_loss:.4f} | Train Disc Loss: {train_disc_loss:.4f} | Val Gen Loss: {val_gen_loss:.4f} | Val Disc Loss: {val_disc_loss:.4f}")
 
-        valid_loss = valid_recon_loss + valid_style_loss + valid_s_e_loss
-        end_time = time.time()
+        print(f"Epoch [{epoch+1}/{num_epochs}] | "
+            f"Train Gen Loss: {train_gen_loss:.4f} | Train Disc Loss: {train_disc_loss:.4f} | "
+            f"Val Gen Loss: {val_gen_loss:.4f} | Val Disc Loss: {val_disc_loss:.4f}")
+        
+        # Save the model if it's the best one so far
+        if val_gen_loss < best_gen_loss:
+            best_gen_loss = val_gen_loss
+            save_checkpoint({
+                'epoch': epoch,
+                'generator_state_dict': generator.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
+                'gen_optimizer_state_dict': gen_optimizer.state_dict(),
+                'disc_optimizer_state_dict': disc_optimizer.state_dict(),
+                'gen_scheduler_state_dict': gen_scheduler.state_dict(),
+                'disc_scheduler_state_dict': disc_scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict()
+            }, f"checkpoint_epoch_{epoch}.pth")
+        # Early stopping check
+        
+        early_stopping(val_gen_loss)
+        if early_stopping.stop:
+            print("Early stopping")
+            return val_gen_loss+val_disc_loss
+        
+    return val_gen_loss+val_disc_loss
 
-        epoch_mins, epoch_secs = epoch_time(start_time, end_time)
-
-        print(f'Epoch: {epoch+1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s')
-        print(f"train: recon_loss:{train_recon_loss}, style_loss:{train_style_loss}, s_e_loss:{train_s_e_loss}, s_adv_loss:{train_s_a_loss}")
-        print(f"valid: recon_loss:{valid_recon_loss}, style_loss:{valid_style_loss}, s_e_loss:{valid_s_e_loss}, s_adv_loss:{valid_s_a_loss}")
-
-        del train_recon_loss, train_style_loss, train_s_a_loss, train_s_e_loss
-        del valid_recon_loss, valid_style_loss, valid_s_a_loss, valid_s_e_loss
-
-        if valid_loss < best_valid_loss:
-            best_valid_loss = valid_loss
-            with open(gconfig.avg_style_emb_path + 'avg_style_emb.pickle', "wb") as f:
-                pickle.dump(model.avg_style_emb, f)
-            torch.save(model.state_dict(), gconfig.model_path + 'model.pt')
-            print(f"----Epoch: {epoch+1} Model Saved!----")
-    
-    return valid_loss
-
-def get_dataloader(df, batch_size, tokenizer, dataset):
-
-    texts, labels = read_essay_split(df, dataset)
-
-    oceandataset = OCEANDataset(texts, labels, tokenizer, dataset)
-
-    loader = DataLoader(oceandataset, batch_size, shuffle=True)
-
-    return loader
